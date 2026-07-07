@@ -8,4 +8,4 @@ __pycache__/
 .env
 
 # 每次執行的產出
-practice/stage1/outputs/
+practice/**/outputs/
