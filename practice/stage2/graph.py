@@ -23,6 +23,7 @@ import json
 import os
 import re
 import time
+import difflib
 from pathlib import Path
 from typing import TypedDict
 
@@ -56,28 +57,98 @@ usage_log: list = []
 node_times: dict = {}
 _current_node = "?"
 
+PRICING = {
+    CHEAP_MODEL: (1.00, 5.00),
+    SMART_MODEL: (3.00, 15.00),
+}
+
+
+def cost_of(entry: dict) -> float:
+    """單筆 LLM 呼叫的成本（USD）。"""
+    price_in, price_out = PRICING.get(entry["model"], (0.0, 0.0))
+    return entry["input"] / 1e6 * price_in + entry["output"] / 1e6 * price_out
+
+
+def print_run_summary(total_wall_s: float) -> None:
+    """執行結束後印出每個節點的時間、token 與成本總表。"""
+    print(f"\n{'=' * 72}")
+    print("執行總結")
+    print(f"{'-' * 72}")
+    print(
+        f"{'節點':<14}{'節點時間':>10}{'LLM呼叫':>8}"
+        f"{'輸入tokens':>12}{'輸出tokens':>12}{'成本USD':>12}"
+    )
+    total_cost = 0.0
+    for name in node_times:
+        calls = [entry for entry in usage_log if entry["node"] == name]
+        tokens_in = sum(entry["input"] for entry in calls)
+        tokens_out = sum(entry["output"] for entry in calls)
+        cost = sum(cost_of(entry) for entry in calls)
+        total_cost += cost
+        print(
+            f"{name:<14}{node_times[name]:>9.1f}s{len(calls):>8}"
+            f"{tokens_in:>12,}{tokens_out:>12,}{cost:>12.4f}"
+        )
+
+    total_node_s = sum(node_times.values())
+    total_in = sum(entry["input"] for entry in usage_log)
+    total_out = sum(entry["output"] for entry in usage_log)
+    print(f"{'-' * 72}")
+    print(
+        f"{'合計(節點)':<14}{total_node_s:>9.1f}s{len(usage_log):>8}"
+        f"{total_in:>12,}{total_out:>12,}{total_cost:>12.4f}"
+    )
+    print(f"{'合計(牆鐘)':<14}{total_wall_s:>9.1f}s")
+
 
 def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
     """所有節點共用的 LLM 呼叫入口，順便把 token 用量記進 usage_log。"""
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    usage_log.append(
-        {
-            "node": _current_node,
-            "model": model,
-            "input": response.usage.input_tokens,
-            "output": response.usage.output_tokens,
-        }
-    )
-    # thinking 模型會先回 ThinkingBlock，不能假設 content[0] 就是文字。
-    text_parts = [block.text for block in response.content if block.type == "text"]
-    if not text_parts:
-        raise ValueError(f"模型回覆中沒有 text block：{response.content!r}")
-    return "".join(text_parts)
+    def _create(tokens: int):
+        return client.messages.create(
+            model=model,
+            max_tokens=tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+
+    # 某些情況下（例如輸出被截斷、或只回 thinking block），content 可能沒有 text block。
+    # 這裡先嘗試正常取 text；若沒有，再用 SDK 的 output_text（若存在）或加大 max_tokens 重試一次。
+    for attempt in range(2):
+        tokens = max_tokens if attempt == 0 else min(max_tokens * 2, 8000)
+        response = _create(tokens)
+
+        usage_log.append(
+            {
+                "node": _current_node,
+                "model": model,
+                "input": response.usage.input_tokens,
+                "output": response.usage.output_tokens,
+            }
+        )
+
+        text_parts = []
+        for block in getattr(response, "content", []) or []:
+            if getattr(block, "type", None) == "text" and hasattr(block, "text"):
+                text_parts.append(block.text)
+
+        if text_parts:
+            return "".join(text_parts)
+
+        output_text = getattr(response, "output_text", "") or ""
+        if output_text.strip():
+            return output_text
+
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "max_tokens" and attempt == 0:
+            continue
+
+        types = [getattr(b, "type", type(b).__name__) for b in (getattr(response, "content", []) or [])]
+        raise ValueError(
+            "模型回覆中沒有可用文字輸出。"
+            f" stop_reason={stop_reason!r}, content_types={types!r}"
+        )
+
+    raise ValueError("模型回覆中沒有可用文字輸出（已重試）。")
 
 
 def instrument(name: str, fn):
@@ -158,6 +229,7 @@ class PipelineState(TypedDict):
     scored_items: list
     insights: str
     draft: str
+    draft_versions: list
 
     # stage2 新增：主編審核與重寫控制
     editor_feedback: str
@@ -354,7 +426,9 @@ def write(state: PipelineState) -> dict:
 
     draft = call_llm(model=SMART_MODEL, system=system, user=user)
     print(f"  [write] 草稿產出 {len(draft)} 字元（第 {state.get('retry_count', 0)} 次）")
-    return {"draft": draft}
+    versions = list(state.get("draft_versions", []))
+    versions.append(draft)
+    return {"draft": draft, "draft_versions": versions}
 
 
 # ---------------------------------------------------------------------------
@@ -400,18 +474,18 @@ def chief_editor(state: PipelineState) -> Command:
         )
         data = _judge_once(repair_prompt, max_tokens=400)
 
-    decision = (data.get("decision") or "").strip().lower()
-    feedback_raw = data.get("feedback") or []
-    if isinstance(feedback_raw, list):
+    decision = (data.get("decision") or "").strip().lower() # 決定是否通過
+    feedback_raw = data.get("feedback") or [] # 回饋意見
+    if isinstance(feedback_raw, list): # 如果回饋意見是列表
         feedback = "\n".join(f"- {s}" for s in feedback_raw if str(s).strip())
-    else:
+    else: # 如果回饋意見不是列表    
         feedback = str(feedback_raw).strip()
 
-    if decision == "approve":
+    if decision == "approve": # 如果決定是通過
         print("  [chief_editor] ✅ 通過")
         return Command(update={"editor_feedback": feedback}, goto=END)
 
-    # decision == revise（或任何非 approve）
+    # decision == revise（或任何非 approve） 或 已達重試上限
     if retry_count >= max_retry:
         print("  [chief_editor] ⚠️ 已達 max_retry，停止重寫並直接結束（保留最後草稿）")
         return Command(
@@ -420,8 +494,8 @@ def chief_editor(state: PipelineState) -> Command:
             },
             goto=END,
         )
-
-    print(f"  [chief_editor] ❌ 退回重寫（{retry_count + 1}/{max_retry}）")
+    
+    print(f"  [chief_editor] ❌ 退回重寫（{retry_count + 1}/{max_retry}）") 
     return Command(
         update={
             "editor_feedback": feedback or "請加強論點、結構與具體例子。",
@@ -468,6 +542,8 @@ if __name__ == "__main__":
     print(f"max_retry：{max_retry}")
     print()
 
+    wall_start = time.perf_counter()
+
     initial_state: PipelineState = {
         "topic": topic,
         "raw_items": [],
@@ -475,6 +551,7 @@ if __name__ == "__main__":
         "scored_items": [],
         "insights": "",
         "draft": "",
+        "draft_versions": [],
         "editor_feedback": "",
         "retry_count": 0,
         "max_retry": max_retry,
@@ -497,10 +574,39 @@ if __name__ == "__main__":
     print("主編回饋：\n")
     print(result.get("editor_feedback", ""))
 
-    # 把草稿存檔，方便比較「退回重做前後」的版本差異
+    # 把每一版草稿存檔，並輸出版本差異（方便比較「退回重做前後」）
     output_dir = Path(__file__).resolve().parent / "outputs"
     output_dir.mkdir(exist_ok=True)
-    output_file = output_dir / f"draft_{re.sub(r'[^一-鿿a-zA-Z0-9]+', '_', topic)}.md"
-    output_file.write_text(result.get("draft", ""))
-    print(f"\n草稿已存到 {output_file}")
+    slug = re.sub(r"[^一-鿿a-zA-Z0-9]+", "_", topic)
+    versions = result.get("draft_versions") or []
+    if versions:
+        for i, draft in enumerate(versions):
+            vf = output_dir / f"draft_{slug}_v{i}.md"
+            vf.write_text(draft)
+        print(f"\n草稿版本數：{len(versions)}（已輸出到 {output_dir}）")
+
+        # 版本差異：只做相鄰版本的 unified diff（v0->v1, v1->v2, ...）
+        diff_lines = []
+        for i in range(len(versions) - 1):
+            a = versions[i].splitlines(keepends=True)
+            b = versions[i + 1].splitlines(keepends=True)
+            diff_lines.extend(
+                difflib.unified_diff(
+                    a,
+                    b,
+                    fromfile=f"draft_{slug}_v{i}.md",
+                    tofile=f"draft_{slug}_v{i+1}.md",
+                )
+            )
+            diff_lines.append("\n")
+        diff_file = output_dir / f"draft_{slug}_diff.txt"
+        diff_file.write_text("".join(diff_lines))
+        print(f"版本差異檔：{diff_file}")
+    else:
+        output_file = output_dir / f"draft_{slug}.md"
+        output_file.write_text(result.get("draft", ""))
+        print(f"\n草稿已存到 {output_file}")
+
+    total_wall_s = time.perf_counter() - wall_start
+    print_run_summary(total_wall_s)
 
