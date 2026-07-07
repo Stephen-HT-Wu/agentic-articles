@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .DS_Store
 .claude/
+
+# 密鑰絕對不能進版控
+.env
+
+# 每次執行的產出
+practice/stage1/outputs/
