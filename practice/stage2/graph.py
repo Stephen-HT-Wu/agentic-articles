@@ -27,10 +27,16 @@ import difflib
 from pathlib import Path
 from typing import TypedDict
 
+import sys
+
 import anthropic
 import requests
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
+
+# 共用基礎設施（只有經過驗證完全一樣的 instrument/cost_of/PRICING，見 _common.py 開頭說明）
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _common import PRICING, cost_of, current_node, instrument, node_times
 
 # ---------------------------------------------------------------------------
 # 環境設定
@@ -51,22 +57,9 @@ SMART_MODEL = "claude-sonnet-5"  # 洞見合成、編輯撰稿、主編審核
 
 client = anthropic.Anthropic()  # 自動讀取 ANTHROPIC_API_KEY
 
-# 執行期間的觀測紀錄：usage_log 收集每次 LLM 呼叫的 token 數（掛在哪個節點下），
-# node_times 收集每個節點的執行秒數。
+# usage_log 收集每次 LLM 呼叫的 token 數（掛在哪個節點下）。
+# node_times（每個節點的執行秒數）現在由 _common.instrument() 維護。
 usage_log: list = []
-node_times: dict = {}
-_current_node = "?"
-
-PRICING = {
-    CHEAP_MODEL: (1.00, 5.00),
-    SMART_MODEL: (3.00, 15.00),
-}
-
-
-def cost_of(entry: dict) -> float:
-    """單筆 LLM 呼叫的成本（USD）。"""
-    price_in, price_out = PRICING.get(entry["model"], (0.0, 0.0))
-    return entry["input"] / 1e6 * price_in + entry["output"] / 1e6 * price_out
 
 
 def print_run_summary(total_wall_s: float) -> None:
@@ -119,7 +112,7 @@ def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
 
         usage_log.append(
             {
-                "node": _current_node,
+                "node": current_node(),
                 "model": model,
                 "input": response.usage.input_tokens,
                 "output": response.usage.output_tokens,
@@ -149,20 +142,6 @@ def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
         )
 
     raise ValueError("模型回覆中沒有可用文字輸出（已重試）。")
-
-
-def instrument(name: str, fn):
-    """包住節點函式：記錄執行時間，並讓 call_llm 知道現在跑到哪個節點。"""
-
-    def wrapped(state):
-        global _current_node
-        _current_node = name
-        start = time.perf_counter()
-        result = fn(state)
-        node_times[name] = node_times.get(name, 0.0) + (time.perf_counter() - start)
-        return result
-
-    return wrapped
 
 
 def extract_json(text: str):

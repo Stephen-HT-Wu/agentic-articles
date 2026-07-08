@@ -26,13 +26,17 @@ warnings.filterwarnings("ignore", category=LangChainPendingDeprecationWarning)
 import json
 import os
 import re
-import time
+import sys
 from pathlib import Path
 from typing import TypedDict
 
 import anthropic
 import requests
 from langgraph.graph import END, START, StateGraph
+
+# 共用基礎設施（只有經過驗證完全一樣的 instrument/cost_of/PRICING，見 _common.py 開頭說明）
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _common import PRICING, cost_of, current_node, instrument, node_times
 
 # ---------------------------------------------------------------------------
 # 環境設定
@@ -54,18 +58,10 @@ SMART_MODEL = "claude-sonnet-5"             # 洞見合成、編輯撰稿
 
 client = anthropic.Anthropic()  # 自動讀取 ANTHROPIC_API_KEY
 
-# 官方牌價（USD / 百萬 tokens），2026-07 查證：Haiku 4.5 = $1/$5，Sonnet 5 = $3/$15。
-# 註：Sonnet 5 到 2026-08-31 前有 $2/$10 優惠價，這裡用標準價估算（寧可高估）。
-PRICING = {
-    CHEAP_MODEL: (1.00, 5.00),
-    SMART_MODEL: (3.00, 15.00),
-}
-
-# 執行期間的觀測紀錄：usage_log 收集每次 LLM 呼叫的 token 數（掛在哪個節點下），
-# node_times 收集每個節點的執行秒數。這就是 PLAN.md 階段 6「觀察與優化」的雛形。
+# usage_log 收集每次 LLM 呼叫的 token 數（掛在哪個節點下）。
+# node_times（每個節點的執行秒數）現在由 _common.instrument() 維護。
+# 這就是 PLAN.md 階段 6「觀察與優化」的雛形。
 usage_log: list = []
-node_times: dict = {}
-_current_node = "?"
 
 
 def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
@@ -77,7 +73,7 @@ def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
         messages=[{"role": "user", "content": user}],
     )
     usage_log.append({
-        "node": _current_node,
+        "node": current_node(),
         "model": model,
         "input": response.usage.input_tokens,
         "output": response.usage.output_tokens,
@@ -87,27 +83,6 @@ def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
     if not text_parts:
         raise ValueError(f"模型回覆中沒有 text block：{response.content!r}")
     return "".join(text_parts)
-
-
-def instrument(name: str, fn):
-    """
-    包住節點函式：記錄執行時間，並讓 call_llm 知道現在跑到哪個節點，
-    這樣 token 花費才能歸屬到正確的節點。graph 結構完全不用改。
-    """
-    def wrapped(state):
-        global _current_node
-        _current_node = name
-        start = time.perf_counter()
-        result = fn(state)
-        node_times[name] = node_times.get(name, 0.0) + (time.perf_counter() - start)
-        return result
-    return wrapped
-
-
-def cost_of(entry: dict) -> float:
-    """單筆 LLM 呼叫的成本（USD）。"""
-    price_in, price_out = PRICING.get(entry["model"], (0.0, 0.0))
-    return entry["input"] / 1e6 * price_in + entry["output"] / 1e6 * price_out
 
 
 def print_run_summary() -> None:

@@ -32,6 +32,7 @@ import json
 import math
 import os
 import re
+import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -41,6 +42,10 @@ import anthropic
 import requests
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
+
+# 共用基礎設施（只有經過驗證完全一樣的 instrument/cost_of/PRICING，見 _common.py 開頭說明）
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _common import PRICING, cost_of, current_node, instrument, node_times, reset_metrics
 
 # ---------------------------------------------------------------------------
 # 環境設定
@@ -69,20 +74,8 @@ MEMORY_SIMILARITY_THRESHOLD = 0.35
 EMBED_DIM = 256
 
 usage_log: list = []
-node_times: dict = {}
 revision_events: list = []
 editor_reviews: list = []
-_current_node = "?"
-
-PRICING = {
-    CHEAP_MODEL: (1.00, 5.00),
-    SMART_MODEL: (3.00, 15.00),
-}
-
-# 計算成本
-def cost_of(entry: dict) -> float:
-    price_in, price_out = PRICING.get(entry["model"], (0.0, 0.0))
-    return entry["input"] / 1e6 * price_in + entry["output"] / 1e6 * price_out
 
 # 印出執行總結
 def print_run_summary(total_wall_s: float) -> None:
@@ -289,7 +282,7 @@ def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
         response = _create(tokens)
         usage_log.append(
             {
-                "node": _current_node,
+                "node": current_node(),
                 "model": model,
                 "input": response.usage.input_tokens,
                 "output": response.usage.output_tokens,
@@ -309,18 +302,6 @@ def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
             continue
         raise ValueError("模型回覆中沒有可用文字輸出。")
     raise ValueError("模型回覆中沒有可用文字輸出（已重試）。")
-
-# 記錄節點時間
-def instrument(name: str, fn):
-    def wrapped(state):
-        global _current_node
-        _current_node = name
-        start = time.perf_counter()
-        result = fn(state)
-        node_times[name] = node_times.get(name, 0.0) + (time.perf_counter() - start)
-        return result
-
-    return wrapped
 
 # 提取 JSON
 def extract_json(text: str):
@@ -876,9 +857,9 @@ graph = builder.compile()
 
 # 運行 pipeline
 def run_pipeline(topic: str, max_retry: int = 1, force_bad_first_draft: bool = False) -> dict:
-    global usage_log, node_times, revision_events, editor_reviews
+    global usage_log, revision_events, editor_reviews
     usage_log = []
-    node_times = {}
+    reset_metrics()
     revision_events = []
     editor_reviews = []
 
