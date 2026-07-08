@@ -9,3 +9,6 @@ __pycache__/
 
 # 每次執行的產出
 practice/**/outputs/
+
+# stage3 跨日記憶（本機持久化，不入版控）
+practice/stage3/memory/

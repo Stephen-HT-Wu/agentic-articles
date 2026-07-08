@@ -31,6 +31,25 @@
 
 **結論**：先做方案一打底跑通，再只在「主編審核」這一關疊加方案二的退回重做迴圈（設最多重試 1-2 次）。
 
+## 可觀測性（Observability）— 各階段共通要求
+
+從 **階段 1** 起，每個 stage 的 `graph.py` 都應內建執行觀測，方便比較架構演進與 token 成本：
+
+| 項目 | 說明 | 輸出位置 |
+|------|------|----------|
+| **每個 agent 執行時間** | `instrument()` 包住節點，累積 `node_times` | 終端「執行總結」表 |
+| **每次 LLM 呼叫的 token** | `call_llm()` 寫入 `usage_log`（含 node 歸屬） | 終端表 + `run_*_summary.json` |
+| **總執行時間** | 牆鐘時間（wall-clock）+ 節點時間合計 | 終端表 |
+| **成本估算** | 依模型牌價估算 USD | 終端表 + JSON |
+| **每輪成果比較** | stage2+ 主編退回時，存 `draft_v0.md`、`draft_v1.md`… 與 diff | `outputs/draft_*_diff.txt` |
+
+實作規範見專案 skill：`.cursor/skills/agentic-pipeline-observability/SKILL.md`
+
+**階段 3 額外觀測**：
+- `dedup_embed` 的 LLM 呼叫數應為 **0**（embedding 去重省 token）
+- `recall_memory` 命中筆數寫入 `run_*_summary.json` 的 `memory_hits`
+- `revision_events` 記錄每次 write / chief_editor 決策，供比較退回重做循環
+
 ## 技術選型：LangGraph + RAG
 
 - **LangGraph** 的 `StateGraph` 同時能承載兩種方案：`add_edge` 做固定順序；
@@ -78,9 +97,9 @@
 | 階段 | 目標 | 產出 / 驗收標準 |
 |---|---|---|
 | 0. 環境與骨架 | 跑通最小的 LangGraph 單節點 | `graph.invoke()` 能跑，看懂 state 怎麼傳遞 |
-| 1. 固定流水線（方案一） | 5 個節點（爬蟲→去重→權威判斷→洞見→編輯）循序跑完 | 輸入一個話題，能一路跑出一份文字草稿 |
-| 2. 條件邊退回重做 | 加入主編審核節點，用 `Command(goto=...)` 做重做迴圈 | 故意讓草稿寫差，觀察真的被退回重寫，且不會無限迴圈（設 max_retry） |
-| 3. 導入 RAG 記憶 | embedding 去重 + 跨日話題記憶 | 跑兩天，第二天能看到系統引用「昨天提過類似話題」 |
+| 1. 固定流水線（方案一） | 5 個節點（爬蟲→去重→權威判斷→洞見→編輯）循序跑完 | 輸入一個話題，能一路跑出一份文字草稿；終端印出每節點時間/token/成本 |
+| 2. 條件邊退回重做 | 加入主編審核節點，用 `Command(goto=...)` 做重做迴圈 | 故意讓草稿寫差，觀察真的被退回重寫，且不會無限迴圈（設 max_retry）；輸出每版草稿與 diff |
+| 3. 導入 RAG 記憶 | embedding 去重 + 跨日話題記憶 | 跑兩天，第二天能看到系統引用「昨天提過類似話題」；`dedup_embed` 零 LLM token |
 | 4. 平行化與壓縮 | 多來源平行爬蟲 + 壓縮節點（可選：子圖巢狀） | 比較平行前後跑完時間，以及壓縮前後傳給洞見合成的 token 數差異 |
 | 5. 視覺化與短影音 | 加上圖表生成與短影音腳本/影片合成 | 完整跑一次「話題輸入→短影片輸出」全程 |
 | 6. 觀察與優化 | 記錄每個節點的 token/成本，調整模型分級 | 能講出具體數字，例如「去重換 embedding 後這階段 token 少了 N%」 |
