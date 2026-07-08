@@ -936,13 +936,17 @@ def chief_editor(state: PipelineState) -> Command:
         f"話題：{state['topic']}\n\n"
         "請只回傳合法 JSON：\n"
         '{ "decision": "approve" 或 "revise", "feedback": ["建議1", "建議2"] }\n\n'
+        "feedback 最多列 4 條、每條不超過 80 字——意見要具體可執行，但不要長篇大論，"
+        "以免超出輸出長度限制。\n\n"
         f"草稿：\n{state['draft']}"
     )
 
     # 若模型回傳非合法 JSON（markdown 圍欄、截斷、多餘說明），不再呼叫 LLM repair：
     # 先前 repair prompt 內含 approve 範例，模型易照抄而誤放行；改為本地保守退回。
+    # max_tokens 600 實測幾乎每次都不夠（feedback 稍微詳細就會截斷），調到 1500
+    # 留緩衝；上面同時限制 feedback 條數/長度，兩者一起才不會又把 token 往上推。
     try:
-        data = _judge_once(prompt, max_tokens=600)
+        data = _judge_once(prompt, max_tokens=1500)
     except Exception:
         print("  [chief_editor] ⚠️ JSON 解析失敗，保守退回")
         data = {
