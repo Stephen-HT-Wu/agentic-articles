@@ -118,18 +118,123 @@ flowchart LR
 
 ---
 
-## Embedding 怎麼算（與 JSON 的關係）
+## Embedding 向量怎麼算出來
 
-記憶庫裡的 `topic_embedding` / `embedding` 不是呼叫外部 API，而是程式內的 **feature hashing**：
+記憶庫裡的 `topic_embedding` / `embedding` **不是**呼叫 OpenAI、Claude 等 embedding API，而是 `graph.py` 內的 **feature hashing**（純 Python、免費、本機即時算完）。
 
-1. 把文字切成 token（英文數字、中文）。
-2. 每個 token 用 **MD5** 映射到 256 維向量的某一格（`EMBED_DIM = 256`）。
-3. L2 正規化後得到單位向量。
-4. 兩向量做內積 = cosine 相似度。
+對應程式：
 
-**重點**：必須用 MD5 等穩定 hash，不能用 Python `hash()`（每次執行結果不同，舊 JSON 裡的向量就失效）。
+```python
+def embed_text(text: str, dim: int = EMBED_DIM) -> list[float]:
+    vec = [0.0] * dim
+    for token in _tokenize(text):
+        digest = hashlib.md5(token.encode("utf-8")).hexdigest()
+        idx = int(digest, 16) % dim
+        vec[idx] += 1.0
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+```
 
-同一套 `embed_text()` 也用於 `dedup_embed`（爬蟲去重），但那是另一條路，門檻是 **0.80**，與記憶檢索無關。
+常數：`EMBED_DIM = 256` → 每個向量是 **256 個浮點數**。
+
+### 步驟 1：分詞（tokenize）
+
+```python
+def _tokenize(text: str) -> list[str]:
+    text = text.lower()
+    return re.findall(r"[a-z0-9\u4e00-\u9fff]+", text)
+```
+
+- 全部轉小寫
+- 抽出英文、數字、中文字
+
+範例：
+
+```
+"AI agents"  →  ["ai", "agents"]
+```
+
+### 步驟 2：每個 token 對應到向量的某一格
+
+對每個 token：
+
+1. 算 **MD5** hash（必須穩定；見下方「為何用 MD5」）
+2. 把 hex 轉成整數，再 `% 256` 得到索引 `idx`（0～255）
+3. 該格 `vec[idx] += 1.0`
+
+為方便理解，假設維度只有 **8**（實際是 256）：
+
+```
+"ai"     → MD5 → idx=3  → vec[3] += 1
+"agents" → MD5 → idx=7  → vec[7] += 1
+
+vec = [0, 0, 0, 1, 0, 0, 0, 1]
+```
+
+### 步驟 3：L2 正規化
+
+把向量除以自己的長度，變成**單位向量**（長度 = 1）：
+
+```
+norm = sqrt(1² + 1²) = √2 ≈ 1.414
+vec  = [0, 0, 0, 1/√2, 0, 0, 0, 1/√2]
+     ≈ [0, 0, 0, 0.707, 0, 0, 0, 0.707]
+```
+
+這就是你在 JSON 裡常看到的 `0.7071067811865475`：**大多數格子是 0，有 token 命中的格子是正數，最後正規化過**。
+
+### 步驟 4：比相似度（cosine）
+
+兩個已正規化的向量做**內積**（對應位置相乘再相加）= **cosine 相似度**：
+
+```python
+def cosine_similarity(a, b):
+    return sum(x * y for x, y in zip(a, b))
+```
+
+話題越像 → 共同 token 越多 → 重疊的格子越多 → 相似度越高。
+
+### 記憶檢索的具體例子
+
+| 今天查詢的話題 | 與 JSON 裡 `"AI agents"` 比對 | 結果 |
+|----------------|-------------------------------|------|
+| `"AI agents"` | token 完全相同 | 相似度 ≈ **1.00**，幾乎一定命中 |
+| `"agentic AI future"` | 有 `ai` 等重疊 token | 相似度中等，可能命中（門檻 0.35） |
+| `"React 19"` | 幾乎沒共同 token | 相似度很低，**不命中** |
+
+寫入 JSON 時會算兩種向量：
+
+```python
+"topic_embedding": embed_text(topic)                    # 只對話題 → 檢索用
+"embedding":       embed_text(f"{topic}\n{insights}")   # 話題+洞見 → 目前未用
+```
+
+### 為何用 MD5，不用 Python `hash()`？
+
+Python 內建 `hash()` 預設帶 **hash randomization**（每次啟動程式結果不同）。若用 `hash()` 算 embedding，昨天存進 JSON 的向量，今天重開程式就對不上了，跨日記憶會失效。MD5 對同一字串永遠給同一結果，適合持久化到 JSON。
+
+### 與「真正的 embedding model」差在哪？
+
+| | Stage 3（feature hashing） | OpenAI 等 embedding API |
+|--|---------------------------|-------------------------|
+| 比對依據 | **字詞是否重疊** | **語意是否相近** |
+| 成本 | 免費、本機 | 要 API、要錢 |
+| 維度 | 256 | 常見 768、1536… |
+| 穩定性 | MD5 固定，JSON 可長期保存 | 模型版次變了，向量可能變 |
+| 近義詞 | `"AI agent"` 與 `"artificial intelligence agent"` 可能配不到 | 通常能配到 |
+
+練習與本機實驗夠用；若要做語意級檢索，可把 `embed_text()` 換成真正的 embedding model，**檢索與 JSON 流程不必大改**。
+
+### 同一套 embedding 的另一個用途
+
+`embed_text()` 也用於 **`dedup_embed`**（爬蟲標題+摘要去重），但那是另一條路：
+
+| 用途 | 比對文字 | 門檻 |
+|------|----------|------|
+| 記憶檢索 | 話題 `topic` | `MEMORY_SIMILARITY_THRESHOLD` = **0.35** |
+| 爬蟲去重 | 標題 + snippet | `DEDUP_SIMILARITY_THRESHOLD` = **0.80** |
+
+兩者共用演算法，門檻與比對對象不同。
 
 ---
 
@@ -248,5 +353,7 @@ JSON 檔本身**不在 state 裡**；節點透過 `load_memory()` / `save_memory
 | `recall_memory()` | LangGraph 節點，產出 `memory_hits` / `memory_context` |
 | `export_memory_library()` | JSON → Markdown |
 | `seed_yesterday_memory()` | 寫入測試用種子資料 |
+| `embed_text()` | 文字 → 256 維向量（feature hashing + MD5） |
+| `cosine_similarity()` | 兩向量內積（cosine 相似度） |
 
-常數：`MEMORY_FILE`、`MEMORY_SIMILARITY_THRESHOLD`（0.35）、`EMBED_DIM`（256）。
+常數：`MEMORY_FILE`、`MEMORY_SIMILARITY_THRESHOLD`（0.35）、`DEDUP_SIMILARITY_THRESHOLD`（0.80）、`EMBED_DIM`（256）。
