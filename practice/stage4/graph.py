@@ -308,6 +308,10 @@ def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
                 "output": response.usage.output_tokens,
             }
         )
+        # 被截斷就直接重試（加大 max_tokens），不管有沒有部分文字——
+        # 否則截斷但非空的回覆會被下面 `if text_parts` 提前 return，永遠輪不到重試。
+        if getattr(response, "stop_reason", None) == "max_tokens" and attempt == 0:
+            continue
         text_parts = [
             block.text
             for block in getattr(response, "content", []) or []
@@ -318,8 +322,6 @@ def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
         output_text = getattr(response, "output_text", "") or ""
         if output_text.strip():
             return output_text
-        if getattr(response, "stop_reason", None) == "max_tokens" and attempt == 0:
-            continue
         raise ValueError("模型回覆中沒有可用文字輸出。")
     raise ValueError("模型回覆中沒有可用文字輸出（已重試）。")
 
@@ -743,8 +745,23 @@ def authority(state: PipelineState) -> dict:
             f"{listing}\n\n"
             '請回傳 JSON 陣列：[{"index": 0, "authority": 4, "reason": "簡短理由"}, ...]。只回傳 JSON。'
         ),
+        # 3 個來源合併後常有 30-40+ 筆，預設 2000 太緊繃、容易被截斷，調高留緩衝。
+        max_tokens=3000,
     )
-    scores = {entry["index"]: entry for entry in extract_json(reply)}
+    try:
+        scores = {entry["index"]: entry for entry in extract_json(reply)}
+    except Exception as error:
+        # 就算加大 max_tokens 後還是解析失敗，也不要讓整條 pipeline 崩掉——
+        # 保底改用社群分數排序，並在 reason 標明這是降級結果，方便事後追查。
+        print(f"  [authority] ⚠️ JSON 解析失敗，改用社群分數排序保底：{error}")
+        fallback_items = sorted(items, key=lambda item: item.get("score", 0), reverse=True)[:8]
+        scored_items = [
+            {**item, "authority": 3, "reason": "（JSON 解析失敗，改用社群分數排序保底）"}
+            for item in fallback_items
+        ]
+        print(f"  [authority] {len(items)} 筆 -> 留下 {len(scored_items)} 筆（保底模式）")
+        return {"scored_items": scored_items}
+
     scored_items = []
     for i, item in enumerate(items):
         entry = scores.get(i)

@@ -288,6 +288,10 @@ def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
                 "output": response.usage.output_tokens,
             }
         )
+        # 被截斷就直接重試（加大 max_tokens），不管有沒有部分文字——
+        # 否則截斷但非空的回覆會被下面 `if text_parts` 提前 return，永遠輪不到重試。
+        if getattr(response, "stop_reason", None) == "max_tokens" and attempt == 0:
+            continue
         text_parts = [
             block.text
             for block in getattr(response, "content", []) or []
@@ -298,8 +302,6 @@ def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
         output_text = getattr(response, "output_text", "") or ""
         if output_text.strip():
             return output_text
-        if getattr(response, "stop_reason", None) == "max_tokens" and attempt == 0:
-            continue
         raise ValueError("模型回覆中沒有可用文字輸出。")
     raise ValueError("模型回覆中沒有可用文字輸出（已重試）。")
 

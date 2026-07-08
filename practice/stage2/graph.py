@@ -119,6 +119,12 @@ def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
             }
         )
 
+        stop_reason = getattr(response, "stop_reason", None)
+        # 被截斷就直接重試（加大 max_tokens），不管有沒有部分文字——
+        # 否則截斷但非空的回覆會被下面 `if text_parts` 提前 return，永遠輪不到重試。
+        if stop_reason == "max_tokens" and attempt == 0:
+            continue
+
         text_parts = []
         for block in getattr(response, "content", []) or []:
             if getattr(block, "type", None) == "text" and hasattr(block, "text"):
@@ -130,10 +136,6 @@ def call_llm(model: str, system: str, user: str, max_tokens: int = 2000) -> str:
         output_text = getattr(response, "output_text", "") or ""
         if output_text.strip():
             return output_text
-
-        stop_reason = getattr(response, "stop_reason", None)
-        if stop_reason == "max_tokens" and attempt == 0:
-            continue
 
         types = [getattr(b, "type", type(b).__name__) for b in (getattr(response, "content", []) or [])]
         raise ValueError(
