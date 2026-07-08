@@ -7,6 +7,8 @@
 
 對應程式：`practice/stage3/graph.py`
 
+**記憶與 JSON 詳細說明**：見 [`memory.md`](memory.md)
+
 ## 流程
 
 ```
