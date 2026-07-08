@@ -503,9 +503,8 @@ def save_memory_entry(topic: str, insights: str, draft: str) -> None:
 
 # 召回相似記憶  
 def recall_similar_memories(topic: str, top_k: int = 3) -> list:
-    memories = load_memory() # 加載記憶庫
     memories = load_memory()
-    if not memories: # 如果記憶庫為空，則返回空列表
+    if not memories:
         return []
     query_vec = embed_text(topic) # 計算文本的向量
     scored = []
@@ -783,13 +782,16 @@ def chief_editor(state: PipelineState) -> Command:
         f"草稿：\n{state['draft']}"
     )
 
-    # 若模型回傳非合法 JSON（常見：markdown 圍欄、截斷、多餘說明），
-    # 改送精簡 prompt 再試一次，避免整條 pipeline 因 parse 失敗中斷。
-    # 取捨：repair 不帶草稿，修復力較弱，但 token 少、較不易再截斷。
+    # 若模型回傳非合法 JSON（markdown 圍欄、截斷、多餘說明），不再呼叫 LLM repair：
+    # 先前 repair prompt 內含 approve 範例，模型易照抄而誤放行；改為本地保守退回。
     try:
-        data = _judge_once(prompt, max_tokens=600) # 調用 LLM 生成草稿
+        data = _judge_once(prompt, max_tokens=600)
     except Exception:
-        data = _judge_once( "請只回傳合法 JSON：" '{ "decision": "approve", "feedback": [] }', max_tokens=200) # 調用 LLM 生成草稿
+        print("  [chief_editor] ⚠️ JSON 解析失敗，保守退回")
+        data = {
+            "decision": "revise",
+            "feedback": ["主編審核回覆格式錯誤，請依洞見與結構重新檢查草稿"],
+        }
 
     decision = (data.get("decision") or "").strip().lower()
     feedback_raw = data.get("feedback") or []
