@@ -190,7 +190,7 @@ def crawl(state: PipelineState) -> dict:
     try:
         response = requests.get(
             "https://hn.algolia.com/api/v1/search",
-            params={"query": topic, "tags": "story", "hitsPerPage": 15},
+            params={"query": topic, "tags": "story", "hitsPerPage": 15}, # 前15筆
             timeout=10,
         )
         for hit in response.json().get("hits", []):
@@ -211,7 +211,7 @@ def crawl(state: PipelineState) -> dict:
     try:
         response = requests.get(
             "https://api.github.com/search/repositories",
-            params={"q": topic, "sort": "stars", "per_page": 15},
+            params={"q": topic, "sort": "stars", "per_page": 15}, # 前15筆
             headers={"User-Agent": "agentic-practice/0.1"},
             timeout=10,
         )
