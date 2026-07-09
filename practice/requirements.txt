@@ -1,3 +1,6 @@
 langgraph
 anthropic
 requests
+matplotlib
+edge-tts
+openai
