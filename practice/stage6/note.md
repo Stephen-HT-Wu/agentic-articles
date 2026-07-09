@@ -90,6 +90,14 @@ ElevenLabs 配音成本（$0.55）完全跟字數成正比，跟章節/圖片密
 | 新增雙重防禦 | narration_text 逐字不變量 | 角色位置強制覆寫、章節覆蓋率不變量（都是不同形式的「不能只信 prompt」） |
 | 單支預估成本 | ~$0.23（含前 4 階段） | ~$0.98（實測，含前段研究/寫稿/審稿） |
 
+## 圖片模型後續升級：`gpt-image-1-mini` → `gpt-image-2`
+
+上面「實測數字」那次真實跑測用的是 `gpt-image-1-mini`——這個模型畫文字幾乎必糊，所以當時 `IMAGE_STYLE_SUFFIX` 明文禁止出現任何文字。之後換成 `gpt-image-2`（2026-04 發布），單獨測過一張「大標題+百分比數字+多組圖示標籤」的資訊圖表，全部清晰可讀——這是文字渲染品質的世代差異，不是換個牌子而已。因此：
+
+- `IMAGE_STYLE_SUFFIX` 拿掉「不要文字」的禁令，改成鼓勵資訊圖表風格（大數字/關鍵詞/圖示標籤），`segment_chapter_scenes` 的 image_prompt 指示也同步放寬
+- 成本計價方式也不一樣：`gpt-image-2` 的 `usage` 物件把 token 拆成 `input_tokens_details.{text_tokens,image_tokens}`／`output_tokens_details.{text_tokens,image_tokens}` 三個桶分別計價（$5／$8／$30 per 1M tokens），不是 `gpt-image-1-mini` 時代單純的 `input_tokens`/`output_tokens` 兩桶——沒注意到這點算出來的成本會是 0
+- **還沒拿完整的 stage6 pipeline 重跑一次驗證 `gpt-image-2` 版本的真實資訊圖表效果**：目前只單獨測過 `generate_scene_images` 這個節點本身（不含完整的爬蟲/研究/寫稿/配音流程），上面 §6 的成本表也還是 `gpt-image-1-mini` 時代的數字，還沒更新
+
 ## 尚未做的部分
 
 - **`perspective_research` 的 `max_tokens` 修正還沒重新真實跑測驗證**：已改成 8000，語法檢查通過、邏輯上應該一次到位，但還沒花真錢再跑一次確認不再觸發截斷重試

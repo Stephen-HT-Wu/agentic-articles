@@ -133,16 +133,22 @@ ELEVENLABS_MODEL = "eleven_multilingual_v2"
 ELEVENLABS_OVERAGE_PER_1K_CHARS = 0.30
 
 # OpenAI 圖片：每個 scene 一張情境圖，當作該段的動畫背景
-OPENAI_IMAGE_MODEL = "gpt-image-1-mini"
+# gpt-image-1-mini 的文字渲染常常是亂碼（實測連小圖示裡的短標籤都會糊），
+# 換成 gpt-image-2（2026-04 發布）——文字準確度大幅提升，實測中文標題/大數字/
+# 圖示標籤都清晰可讀，才有辦法做真正的資訊圖表風格，不只是裝飾性插畫。
+OPENAI_IMAGE_MODEL = "gpt-image-2"
 OPENAI_IMAGE_SIZE = "1024x1536"  # 最接近的直式 preset，跟畫布 9:16 長寬比不同，後續用 ffmpeg cover-crop
 OPENAI_IMAGE_QUALITY = "low"
-# 只放不能妥協的硬限制（尺寸、AI 圖片生成常見失敗模式）；具體畫風／抽象或具象交給
-# segment_scenes 依每段內容自己決定，不然「深色系抽象科技插畫」套在所有場景上，
-# 5 段圖片會變成只是顏色分佈不同的同一種色塊構圖，失去「畫面跟著內容變化」的意義。
-IMAGE_STYLE_SUFFIX = "，深色系配色，不要出現任何文字/字母/數字/標誌，直式構圖"
-# gpt-image-1-mini 的每 token 單價（實作前對照 OpenAI 官方定價頁確認，這裡先用查到的估算值）
-OPENAI_IMAGE_PRICE_PER_1M_INPUT = 2.00
-OPENAI_IMAGE_PRICE_PER_1M_OUTPUT = 8.00
+# 只放不能妥協的硬限制（尺寸、人物肖像的肖像權風險）；拿掉「不要文字」的舊限制——
+# 那是為文字容易糊掉的 gpt-image-1-mini 設的防禦，換成 gpt-image-2 後改成鼓勵
+# 資訊圖表風格（大數字/關鍵詞/簡短標籤），讓畫面資訊量更高，不只是背景裝飾。
+IMAGE_STYLE_SUFFIX = "，深色系資訊圖表風格，可包含簡短的中文文字標籤或數字重點，字要大而清楚，不要出現人物肖像，直式構圖"
+# gpt-image-2 依 usage.input_tokens_details/output_tokens_details 分別計價
+# （文字輸入/圖片輸入/圖片輸出三個桶），比 gpt-image-1-mini 時代單一 input/output
+# 兩桶更細——這裡對照官方定價頁的估算值，實際帳單校正見 note.md。
+OPENAI_IMAGE_PRICE_PER_1M_TEXT_INPUT = 5.00
+OPENAI_IMAGE_PRICE_PER_1M_IMAGE_INPUT = 8.00
+OPENAI_IMAGE_PRICE_PER_1M_IMAGE_OUTPUT = 30.00
 
 SCENE_COUNT_MIN = 3
 SCENE_COUNT_MAX = 5
@@ -1594,8 +1600,9 @@ def segment_chapter_scenes(state: PipelineState) -> dict:
                     f"（chapter 標題：{chapter['title']}，屬於「{chapter['role']}」段落），"
                     "只能在句子邊界切，不能改寫、增刪、調整任何一個字——"
                     "所有片段的 narration_text 依序接起來，必須逐字等於下面這段原文。"
-                    "每段配一句 image_prompt（20字內，畫面要能對應這段內容且彼此有視覺差異，"
-                    "不要提到文字/字幕/人物肖像）。\n\n"
+                    "每段配一句 image_prompt（30字內，畫面要能對應這段內容且彼此有視覺差異——"
+                    "可以是資訊圖表風格，指定要出現的大數字、關鍵詞、圖示標籤等具體文字內容，"
+                    "也可以是純視覺化的場景插畫，依內容決定；不要提到人物肖像）。\n\n"
                     '輸出 JSON 陣列：[{"narration_text": "...", "image_prompt": "..."}, ...]\n\n'
                     f"原文：\n{chapter['narration_text']}"
                 ),
@@ -1785,15 +1792,18 @@ def _generate_scene_image(prompt: str, dest: Path) -> dict:
     _cover_crop(raw, dest)
     raw.unlink(missing_ok=True)
     usage = getattr(response, "usage", None)
+    in_details = getattr(usage, "input_tokens_details", None) if usage else None
+    out_details = getattr(usage, "output_tokens_details", None) if usage else None
     return {
-        "input_tokens": getattr(usage, "input_tokens", 0) if usage else 0,
-        "output_tokens": getattr(usage, "output_tokens", 0) if usage else 0,
+        "text_tokens_in": getattr(in_details, "text_tokens", 0) if in_details else 0,
+        "image_tokens_in": getattr(in_details, "image_tokens", 0) if in_details else 0,
+        "image_tokens_out": getattr(out_details, "image_tokens", 0) if out_details else 0,
     }
 
 
 def generate_scene_images(state: PipelineState) -> dict:
     """
-    每個 scene 各生成一張情境圖（OpenAI gpt-image-1-mini）+ ffmpeg cover-crop 成 9:16，
+    每個 scene 各生成一張情境圖（OpenAI gpt-image-2）+ ffmpeg cover-crop 成 9:16，
     讓不同段落的畫面真的不一樣（不再是整支影片只推近同一張圖）。
     單一 scene 生成失敗只跳過該 scene（image_path=""），不中斷整個節點；
     完全沒有 OPENAI_API_KEY 或全部失敗，就讓所有 scene 的 image_path 留空，
@@ -1817,8 +1827,9 @@ def generate_scene_images(state: PipelineState) -> dict:
         try:
             usage = _generate_scene_image(scene["image_prompt"], dest)
             cost = (
-                usage["input_tokens"] / 1_000_000 * OPENAI_IMAGE_PRICE_PER_1M_INPUT
-                + usage["output_tokens"] / 1_000_000 * OPENAI_IMAGE_PRICE_PER_1M_OUTPUT
+                usage["text_tokens_in"] / 1_000_000 * OPENAI_IMAGE_PRICE_PER_1M_TEXT_INPUT
+                + usage["image_tokens_in"] / 1_000_000 * OPENAI_IMAGE_PRICE_PER_1M_IMAGE_INPUT
+                + usage["image_tokens_out"] / 1_000_000 * OPENAI_IMAGE_PRICE_PER_1M_IMAGE_OUTPUT
             )
             media_usage_log.append(
                 {"node": current_node(), "service": "openai_image", "scene": i, "cost_usd": cost}
