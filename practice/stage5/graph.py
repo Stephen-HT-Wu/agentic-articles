@@ -130,7 +130,10 @@ ELEVENLABS_OVERAGE_PER_1K_CHARS = 0.30
 OPENAI_IMAGE_MODEL = "gpt-image-1-mini"
 OPENAI_IMAGE_SIZE = "1024x1536"  # 最接近的直式 preset，跟畫布 9:16 長寬比不同，後續用 ffmpeg cover-crop
 OPENAI_IMAGE_QUALITY = "low"
-IMAGE_STYLE_SUFFIX = "，深色系抽象科技插畫，不要出現任何文字/字母/數字/標誌，直式構圖"
+# 只放不能妥協的硬限制（尺寸、AI 圖片生成常見失敗模式）；具體畫風／抽象或具象交給
+# segment_scenes 依每段內容自己決定，不然「深色系抽象科技插畫」套在所有場景上，
+# 5 段圖片會變成只是顏色分佈不同的同一種色塊構圖，失去「畫面跟著內容變化」的意義。
+IMAGE_STYLE_SUFFIX = "，深色系配色，不要出現任何文字/字母/數字/標誌，直式構圖"
 # gpt-image-1-mini 的每 token 單價（實作前對照 OpenAI 官方定價頁確認，這裡先用查到的估算值）
 OPENAI_IMAGE_PRICE_PER_1M_INPUT = 2.00
 OPENAI_IMAGE_PRICE_PER_1M_OUTPUT = 8.00
@@ -1303,8 +1306,9 @@ def segment_scenes(state: PipelineState) -> dict:
             f"請把以下旁白稿拆成 {SCENE_COUNT_MIN}-{SCENE_COUNT_MAX} 段場景，"
             "只能在句子邊界切，不能改寫、增刪、調整任何一個字——"
             "所有片段的 narration_text 依序接起來，必須逐字等於原始旁白稿。"
-            "每段另外配一句 image_prompt（20 字內，描述這段內容適合的畫面意象，"
-            "不要提到文字/字幕/人物肖像）。\n\n"
+            "每段另外配一句 image_prompt（20 字內，具體描述這段內容適合的畫面——"
+            "依內容決定用抽象視覺化、具體場景插畫、或圖標式構圖，不要每段都套同一種畫風，"
+            "讓不同場景之間有明顯視覺差異；不要提到文字/字幕/人物肖像）。\n\n"
             '輸出 JSON 陣列，格式：[{"narration_text": "...", "image_prompt": "..."}, ...]\n\n'
             f"旁白稿：\n{script}"
         ),
