@@ -32,6 +32,7 @@
 
 執行範例：
     python stage6/graph.py "AI agents" 1
+    python stage6/graph.py "AI agents" 1 --no-zoompan      # 場景靜態定格（資訊圖表文字多，推近會干擾閱讀）
     python stage6/graph.py "AI agents" --rerender-images   # 只重生圖 + 重合成影片
 """
 
@@ -137,12 +138,18 @@ ELEVENLABS_OVERAGE_PER_1K_CHARS = 0.30
 # 換成 gpt-image-2（2026-04 發布）——文字準確度大幅提升，實測中文標題/大數字/
 # 圖示標籤都清晰可讀，才有辦法做真正的資訊圖表風格，不只是裝飾性插畫。
 OPENAI_IMAGE_MODEL = "gpt-image-2"
-OPENAI_IMAGE_SIZE = "1024x1536"  # 最接近的直式 preset，跟畫布 9:16 長寬比不同，後續用 ffmpeg cover-crop
+# 1024x1536（2:3=0.667）跟畫布 1080x1920（9:16=0.5625）長寬比差很多，cover-crop
+# 會裁掉約 100px/邊（以 1024 寬計），資訊圖表常把文字放在版面邊緣，實測真的會被切字。
+# 1024x1792（0.571）非常接近 9:16，crop 只需裁掉約 8px/邊，幾乎不影響版面完整性。
+OPENAI_IMAGE_SIZE = "1024x1792"
 OPENAI_IMAGE_QUALITY = "low"
-# 只放不能妥協的硬限制（尺寸、人物肖像的肖像權風險）；拿掉「不要文字」的舊限制——
-# 那是為文字容易糊掉的 gpt-image-1-mini 設的防禦，換成 gpt-image-2 後改成鼓勵
-# 資訊圖表風格（大數字/關鍵詞/簡短標籤），讓畫面資訊量更高，不只是背景裝飾。
-IMAGE_STYLE_SUFFIX = "，深色系資訊圖表風格，可包含簡短的中文文字標籤或數字重點，字要大而清楚，不要出現人物肖像，直式構圖"
+# 只放不能妥協的硬限制（尺寸、人物肖像的肖像權風險、邊緣留白給 cover-crop 當保險）；
+# 拿掉「不要文字」的舊限制——那是為文字容易糊掉的 gpt-image-1-mini 設的防禦，
+# 換成 gpt-image-2 後改成鼓勵資訊圖表風格（大數字/關鍵詞/簡短標籤）。
+IMAGE_STYLE_SUFFIX = (
+    "，深色系資訊圖表風格，可包含簡短的中文文字標籤或數字重點，字要大而清楚，"
+    "重要文字與版面元素請集中在畫面中央，避免緊貼左右邊緣，不要出現人物肖像，直式構圖"
+)
 # gpt-image-2 依 usage.input_tokens_details/output_tokens_details 分別計價
 # （文字輸入/圖片輸入/圖片輸出三個桶），比 gpt-image-1-mini 時代單一 input/output
 # 兩桶更細——這裡對照官方定價頁的估算值，實際帳單校正見 note.md。
@@ -767,6 +774,7 @@ class PipelineState(TypedDict):
     video_script: str  # 全片旁白（各章節 narration_text 接起來），~1500-1700 字
     narration_stats: dict
     video_scenes: list  # 每筆多了 chapter_id/chapter_role/chapter_title（stage5 沒有這三個）
+    use_zoompan: bool  # False = 場景靜態定格（資訊圖表模式），只保留 xfade 轉場
     video_assets: dict
 
 
@@ -1852,16 +1860,26 @@ def _zoompan_rate(duration_s: float) -> float:
     return ZOOM_RANGE / max(duration_s * VIDEO_FPS, 1)
 
 
-def _render_scene_clip(image_path: str, duration_s: float, clip_path: Path) -> None:
-    frame_count = int(duration_s * VIDEO_FPS) + VIDEO_FPS
-    zoom_rate = _zoompan_rate(duration_s)
-    zoom_max = 1 + ZOOM_RANGE
-    vf = (
-        f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},"
-        f"zoompan=z='min(zoom+{zoom_rate:.6f},{zoom_max})':d={frame_count}"
-        f":s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={VIDEO_FPS}"
-    )
+def _render_scene_clip(
+    image_path: str, duration_s: float, clip_path: Path, use_zoompan: bool = True
+) -> None:
+    if use_zoompan:
+        frame_count = int(duration_s * VIDEO_FPS) + VIDEO_FPS
+        zoom_rate = _zoompan_rate(duration_s)
+        zoom_max = 1 + ZOOM_RANGE
+        vf = (
+            f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
+            f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},"
+            f"zoompan=z='min(zoom+{zoom_rate:.6f},{zoom_max})':d={frame_count}"
+            f":s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={VIDEO_FPS}"
+        )
+    else:
+        # 資訊圖表模式：畫面本身有大量文字要讀，Ken Burns 推近反而干擾閱讀
+        # （字一直在動、邊緣還會被放大裁掉），改成靜態定格，只保留 xfade 轉場。
+        vf = (
+            f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
+            f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},fps={VIDEO_FPS}"
+        )
     subprocess.run(
         [
             "ffmpeg", "-y", "-loop", "1", "-i", image_path, "-vf", vf,
@@ -1954,12 +1972,18 @@ def compose_video(state: PipelineState) -> dict:
     if not scene_specs:
         scene_specs = [{"image_path": "", "duration_s": audio_seconds}]
 
+    use_zoompan = bool(state.get("use_zoompan", True))
+    if not use_zoompan:
+        print("  [compose_video] 靜態定格模式（--no-zoompan）：不做 Ken Burns 推近，只保留轉場")
+
     clip_paths = []
     for i, scene in enumerate(scene_specs):
         image_path = scene.get("image_path") or fallback_bg
         clip_path = output_dir / f"clip_{slug}_{i}.mp4"
         try:
-            _render_scene_clip(image_path, scene["duration_s"] + XFADE_DURATION, clip_path)
+            _render_scene_clip(
+                image_path, scene["duration_s"] + XFADE_DURATION, clip_path, use_zoompan
+            )
             clip_paths.append(clip_path)
         except subprocess.CalledProcessError as error:
             print(f"  [compose_video] ⚠️ scene {i} 短片合成失敗，跳過這段：{error.stderr[-200:]}")
@@ -2032,11 +2056,11 @@ builder.add_edge("compose_video", END)
 graph = builder.compile()
 
 
-def rerender_images(topic: str) -> dict:
+def rerender_images(topic: str, use_zoompan: bool = True) -> dict:
     """
     只重跑 generate_scene_images → compose_video。
     從上次 run_{slug}_summary.json 讀分鏡、音檔、圖表路徑，不重跑爬蟲/寫稿/配音。
-    適合：OpenAI billing limit 調好後，補生場景圖並重合成影片。
+    適合：OpenAI billing limit 調好後補生場景圖，或想換 zoompan/靜態模式重合成影片。
     """
     global media_usage_log
     media_usage_log = []
@@ -2077,6 +2101,7 @@ def rerender_images(topic: str) -> dict:
         "video_assets": {**assets, "audio": audio_path},
         "chart_path": chart_path if Path(chart_path).exists() else "",
         "video_script": report.get("video_script") or "",
+        "use_zoompan": use_zoompan,
     }
 
     wall_start = time.perf_counter()
@@ -2106,6 +2131,7 @@ def run_pipeline(
     max_retry: int = 1,
     force_bad_first_draft: bool = False,
     sequential_crawl: bool = False,
+    use_zoompan: bool = True,
 ) -> dict:
     global usage_log, revision_events, editor_reviews, media_usage_log
     usage_log = []
@@ -2140,6 +2166,7 @@ def run_pipeline(
         "video_script": "",
         "narration_stats": {},
         "video_scenes": [],
+        "use_zoompan": use_zoompan,
         "video_assets": {},
     }
 
@@ -2233,6 +2260,11 @@ if __name__ == "__main__":
         action="store_true",
         help="只重生場景圖並重合成影片（讀取上次 run_*_summary.json，不重跑爬蟲/寫稿/配音）",
     )
+    parser.add_argument(
+        "--no-zoompan",
+        action="store_true",
+        help="場景靜態定格、只保留 xfade 轉場——資訊圖表畫面文字多，推近反而干擾閱讀",
+    )
     args = parser.parse_args()
 
     if args.show_memory:
@@ -2240,11 +2272,12 @@ if __name__ == "__main__":
     elif args.seed_yesterday:
         seed_yesterday_memory()
     elif args.rerender_images:
-        rerender_images(args.topic)
+        rerender_images(args.topic, use_zoompan=not args.no_zoompan)
     else:
         print(f"話題：{args.topic}")
         print(f"max_retry：{args.max_retry}")
         print(f"爬蟲模式：{'序列' if args.sequential else '平行'}")
+        print(f"場景動畫：{'靜態定格（--no-zoompan）' if args.no_zoompan else 'Ken Burns 推近'}")
         print(f"記憶庫：{MEMORY_FILE}")
         print()
         run_pipeline(
@@ -2252,4 +2285,5 @@ if __name__ == "__main__":
             args.max_retry,
             force_bad_first_draft=args.bad_first,
             sequential_crawl=args.sequential,
+            use_zoompan=not args.no_zoompan,
         )
